@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Visualizzatore AirPods — Realistico (Draco)</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+        canvas { display: block; position: relative; z-index: 1; background: transparent !important; }
+        /* Sfondo come layer DOM dietro il canvas trasparente. Il background NON puo'
+           stare nella scena perche' il RenderPass applica ACES anche ad esso
+           (#fff diventa #e8). Tenendolo in DOM resta esatto: #fff -> #dedede. */
+        #bg-gradient {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            background-image: linear-gradient(#fff 50%, #dedede);
+        }
+
+        #color-picker {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 10;
+        }
+        .dot {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            cursor: pointer;
+            border: 2px solid rgba(0,0,0,0.15);
+            transition: transform 0.2s;
+        }
+        .dot:hover { transform: scale(1.1); }
+
+        #light-controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(255,255,255,0.7);
+            backdrop-filter: blur(8px);
+            border-radius: 10px;
+            padding: 12px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            font-family: -apple-system, system-ui, sans-serif;
+            font-size: 12px;
+            color: #333;
+            user-select: none;
+        }
+        #light-controls .row { display: flex; align-items: center; gap: 10px; }
+        #light-controls .lbl { width: 48px; color: #888; }
+        #light-controls .toggle {
+            border: 1px solid #ccc;
+            background: #fff;
+            border-radius: 6px;
+            padding: 4px 12px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            color: #333;
+        }
+        #light-controls .toggle:hover { background: #f0f0f0; }
+        #light-controls input[type=range] { width: 130px; cursor: pointer; }
+        #light-controls #rot-val { width: 34px; text-align: right; color: #888; }
+    </style>
+</head>
+<body>
+
+    <div id="bg-gradient"></div>
+
+    <div id="light-controls">
+        <div class="row">
+            <span class="lbl">Luci</span>
+            <button id="mode-btn" class="toggle">180°</button>
+        </div>
+        <div class="row">
+            <span class="lbl">Origine</span>
+            <input id="rot-slider" type="range" min="0" max="360" value="0" step="1">
+            <span id="rot-val">0°</span>
+        </div>
+    </div>
+
+    <div id="color-picker">
+        <div class="dot" style="background-color: #424240;" onclick="resetColors()"></div>
+        <div class="dot" style="background-color: #ECE4D9;" onclick="updateBaseColor('bianco1.png', 'bianco2.png')"></div>
+        <div class="dot" style="background-color: #F7BEA2;" onclick="updateBaseColor('rosa1.png', 'rosa2.png')"></div>
+        <div class="dot" style="background-color: #7E8FA0;" onclick="updateBaseColor('blu1.png', 'blu2.png')"></div>
+        <div class="dot" style="background-color: #B5C3B1;" onclick="updateBaseColor('verde1.png', 'verde2.png')"></div>
+        <div class="dot" style="background-color: #BDB4C9;" onclick="updateBaseColor('viola1.png', 'viola2.png')"></div>
+        <div class="dot" style="background-color: #B8615A;" onclick="updateBaseColor('rosso1.png', 'rosso2.png')"></div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ============================================================
+        //  SCENA
+        //  Niente piani d'appoggio: il prodotto fluttua nel vuoto.
+        //  Sfondo grigio chiarissimo (non bianco puro) per far "staccare"
+        //  il prodotto e dare un look da still-life premium.
+        // ============================================================
+        const BG_COLOR = 0xe8e8ea;
+        const scene = new THREE.Scene();
+        // Nessuno sfondo nella scena: il canvas e' trasparente e mostra il div
+        // #bg-gradient dietro. Cosi' il gradiente NON passa per il RenderPass
+        // (che applicherebbe ACES) e resta esatto.
+        scene.background = null;
+
+        const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, premultipliedAlpha: false });
+        renderer.setClearColor(0x000000, 0); // alpha 0 = canvas trasparente
+        renderer.setClearAlpha(0);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        // ACES: resa fotografica, gestisce bene gli highlight speculari delle superfici lucide
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.0;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        controls.minDistance = 0.5;
+        controls.maxDistance = 20;
+
+        // ============================================================
+        //  ENVIRONMENT STUDIO CUSTOM — "vetrina Apple Store"
+        //  Costruisco in memoria una scena con strisce verticali emissive
+        //  luminose (softbox a colonna) su fondo scuro neutro. Sono questi
+        //  riflessi ad ALTO CONTRASTO che fanno leggere le superfici come
+        //  METALLO: bande chiare nette che scorrono sul riflesso mentre il
+        //  prodotto ruota. ZERO download: generato col PMREMGenerator.
+        // ============================================================
+        function buildStudioEnvironment(mode, rotationDeg) {
+            const envScene = new THREE.Scene();
+            // Fondo scuro neutro: il contrasto col chiaro delle softbox e' cio'
+            // che da' "mordente" al metallo. Troppo chiaro = metallo slavato.
+            envScene.background = new THREE.Color(0x1a1a1e);
+
+            // Materiale emissivo per i pannelli luminosi
+            const makePanel = (w, h, intensity, color = 0xffffff) => {
+                const mat = new THREE.MeshBasicMaterial({ color });
+                mat.color.multiplyScalar(intensity); // > 1 = sovraesposto, fiorisce nei riflessi
+                const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+                return mesh;
+            };
+
+            const RADIUS = 7;
+            const rot = rotationDeg || 0; // offset angolare: "sposta" l'origine delle luci
+
+            // Helper: posiziona una striscia a un dato angolo (+ offset rotazione)
+            const addStripe = (angleDeg, w, h, i, color = 0xffffff) => {
+                const panel = makePanel(w, h, i, color);
+                const rad = THREE.MathUtils.degToRad(angleDeg + rot);
+                panel.position.set(Math.sin(rad) * RADIUS, 0, Math.cos(rad) * RADIUS);
+                panel.lookAt(0, 0, 0);
+                envScene.add(panel);
+            };
+
+            if (mode === 360) {
+                // --- 360°: softbox tutt'intorno, riflessi da ogni lato ---
+                const data360 = [
+                    { a:   0, w: 2.0, h: 10, i: 4.5 }, { a:  30, w: 0.7, h: 9, i: 6.0 },
+                    { a:  60, w: 1.5, h: 9,  i: 3.5 }, { a:  90, w: 1.0, h: 9, i: 5.0 },
+                    { a: 120, w: 1.8, h: 9,  i: 3.8 }, { a: 150, w: 0.7, h: 8, i: 5.5 },
+                    { a: 180, w: 2.0, h: 10, i: 4.0 }, { a: 210, w: 0.8, h: 9, i: 5.5 },
+                    { a: 240, w: 1.6, h: 9,  i: 3.8 }, { a: 270, w: 1.0, h: 9, i: 5.0 },
+                    { a: 300, w: 1.7, h: 9,  i: 3.8 }, { a: 330, w: 0.7, h: 9, i: 6.0 },
+                ];
+                for (const s of data360) addStripe(s.a, s.w, s.h, s.i);
+            } else {
+                // --- 180°: softbox ad arco su davanti/lati (look piu' drammatico) ---
+                const data180 = [
+                    { a: -55, w: 1.4, h: 9, i: 3.5 }, { a: -28, w: 0.7, h: 9,  i: 5.0 },
+                    { a:  -8, w: 2.2, h: 10, i: 4.0 }, { a:  15, w: 0.6, h: 9, i: 6.0 },
+                    { a:  40, w: 1.6, h: 9, i: 3.5 }, { a:  70, w: 0.9, h: 8,  i: 4.5 },
+                ];
+                for (const s of data180) addStripe(s.a, s.w, s.h, s.i);
+                // due strisce deboli dietro per il bordo (rim)
+                addStripe(150, 1.0, 8, 2.5, 0xdfe8ff);
+                addStripe(205, 1.2, 8, 2.8, 0xdfe8ff);
+            }
+
+            // --- PANNELLO SUPERIORE (fill morbido dall'alto) ---
+            const top = makePanel(14, 14, 1.4);
+            top.rotation.x = Math.PI / 2;
+            top.position.set(0, 6, 0);
+            envScene.add(top);
+
+            // --- PANNELLO INFERIORE (riempe l'ombra propria, debole) ---
+            const bottom = makePanel(12, 12, 0.5);
+            bottom.rotation.x = -Math.PI / 2;
+            bottom.position.set(0, -6, 0);
+            envScene.add(bottom);
+
+            return envScene;
+        }
+
+        // ============================================================
+        //  GENERAZIONE ENVIRONMENT AD ALTA RISOLUZIONE
+        //  PMREMGenerator.fromScene() cattura SEMPRE a 256px (hardcoded), ed e'
+        //  quello che faceva apparire i riflessi a blocchi quando l'oggetto e'
+        //  piccolo a schermo. Soluzione: renderizziamo la scena-studio in un
+        //  CubeRenderTarget ad alta risoluzione, poi lo convertiamo in mappa
+        //  PMREM con fromCubemap() -> riflessi continui anche da lontano.
+        // ============================================================
+        const ENV_RES = 1024; // risoluzione per faccia della cubemap (alza/abbassa qui)
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        pmrem.compileCubemapShader();
+
+        // Stato corrente dei controlli luci
+        let lightMode = 180;     // 180 o 360
+        let lightRotation = 0;   // offset angolare in gradi (0-360)
+        let currentEnvRT = null; // per liberare la mappa precedente quando si rigenera
+
+        // (Ri)genera l'environment con modalita' e rotazione correnti e lo applica
+        // alla scena. Chiamata all'avvio e a ogni cambio dei controlli UI.
+        function regenerateEnvironment() {
+            const studioEnv = buildStudioEnvironment(lightMode, lightRotation);
+            const cubeRT = new THREE.WebGLCubeRenderTarget(ENV_RES, {
+                type: THREE.HalfFloatType,
+                minFilter: THREE.LinearMipmapLinearFilter,
+                generateMipmaps: true,
+            });
+            const cubeCam = new THREE.CubeCamera(0.1, 100, cubeRT);
+            cubeCam.update(renderer, studioEnv);
+            const newEnvRT = pmrem.fromCubemap(cubeRT.texture);
+            cubeRT.dispose();
+            if (currentEnvRT) currentEnvRT.dispose(); // libera la mappa vecchia
+            currentEnvRT = newEnvRT;
+            scene.environment = newEnvRT.texture;
+            scene.environmentIntensity = 1.25;
+        }
+        regenerateEnvironment(); // generazione iniziale (180°, rotazione 0)
+
+        // ============================================================
+        //  LUCI — tre punti morbidi. Intensita' contenute e fill piu' presente
+        //  per transizioni luce/ombra graduali (meno contrasto duro).
+        //  L'environment sfocato fa il grosso dell'illuminazione.
+        // ============================================================
+        const keyLight = new THREE.DirectionalLight(0xffffff, 1.4); // piu' bassa = meno stacco duro
+        keyLight.position.set(5, 7, 6);
+        scene.add(keyLight);
+
+        const rimLight = new THREE.DirectionalLight(0xdfe8ff, 0.9); // luce fredda da dietro = bordo brillante
+        rimLight.position.set(-6, 4, -5);
+        scene.add(rimLight);
+
+        const fillLight = new THREE.DirectionalLight(0xffffff, 1.0); // piu' presente: ammorbidisce le ombre
+        fillLight.position.set(-2, -3, 4);
+        scene.add(fillLight);
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.35)); // base diffusa: transizioni piu' morbide
+
+        const textureLoader = new THREE.TextureLoader();
+        let airpodsModel = null;
+
+        const loadTexture = (url, isSRGB = true) => {
+            const tex = textureLoader.load(url);
+            tex.flipY = false;
+            tex.colorSpace = isSRGB ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+            tex.anisotropy = renderer.capabilities.getMaxAnisotropy(); // texture nitide ad angoli radenti
+            // Mipmap + filtro trilineare: ESSENZIALE contro l'aliasing speculare.
+            // Da lontano una normal/roughness map ad alta frequenza, senza mipmap,
+            // fa rimbalzare il riflesso a blocchi sulle superfici lucide. Le mipmap
+            // danno a three versioni pre-rimpicciolite e mediate della texture.
+            tex.generateMipmaps = true;
+            tex.minFilter = THREE.LinearMipmapLinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.needsUpdate = true;
+            return tex;
+        };
+
+        // ============================================================
+        //  ORM — le uniche mappe NON presenti nel GLB: le aggiungiamo qui.
+        //  Il modello arriva gia' con base color + normali collegate
+        //  dall'artista; noi tocchiamo SOLO la parte metal/rough/AO.
+        //  Caricate una volta sola e agganciate per NOME materiale:
+        //    materiale 'baking'             -> orm1
+        //    materiali 'baking 2' / 'baking 3' -> orm2
+        // ============================================================
+        const orm1 = loadTexture('orm1.png', false); // dati lineari (NoColorSpace)
+        const orm2 = loadTexture('orm2.png', false);
+
+        // ============================================================
+        //  SHADOW LIFT sulla BASE COLOR
+        //  Solleva SOLO le zone scure (le ombre) della base color colore1/colore2,
+        //  cosi' il nero non resta schiacciato e si recupera dettaglio. Agisce
+        //  via onBeforeCompile sul map gia' campionato, PRIMA che diventi diffuse:
+        //  non tocca tone mapping globale, metallo, riflessi ne' sfondo.
+        //  amount = quanto si alzano le ombre (0 = niente, 0.12 = deciso).
+        function applyShadowLift(mat, amount = 0.1) {
+            mat.onBeforeCompile = (shader) => {
+                shader.uniforms.uShadowLift = { value: amount };
+                shader.fragmentShader = shader.fragmentShader
+                    .replace(
+                        'uniform float opacity;',
+                        'uniform float opacity;\nuniform float uShadowLift;'
+                    )
+                    .replace(
+                        '#include <map_fragment>',
+                        `#include <map_fragment>
+                        // Lift delle sole ombre: alza i valori bassi, lascia le luci.
+                        // luma del colore campionato -> peso che decresce verso i chiari.
+                        {
+                            float luma = dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+                            float shadowWeight = 1.0 - smoothstep(0.0, 0.05, luma);
+                            diffuseColor.rgb += uShadowLift * shadowWeight;
+                        }`
+                    );
+            };
+            mat.needsUpdate = true;
+        }
+
+        // Mappa nome-materiale -> ORM da agganciare
+        const ORM_BY_MATERIAL = {
+            'baking':   orm1,
+            'baking 2': orm2,
+            'baking 3': orm2,
+        };
+
+        // ============================================================
+        //  PICKER — cambia SOLO la base color. I materiali del GLB restano
+        //  quelli originali; sostituiamo solo la texture .map. Le base color
+        //  sono in cache (caricate una volta), quindi il cambio e' istantaneo.
+        //  Convenzione file: '...1.png' -> materiale 'baking' (destra_low),
+        //  '...2.png' -> 'baking 2' e 'baking 3' (destra_low2 + tessuto).
+        // ============================================================
+
+        // Schiarimento mirato per blu2.png: moltiplicatore sul .color del materiale
+        // (1.0 = invariato, >1 = piu' chiaro). Alza/abbassa qui.
+        const BLU2_LIGHTEN = 1.05;
+
+        const colorCache = {};
+        const getColorTexture = (url) => {
+            if (!colorCache[url]) colorCache[url] = loadTexture(url, true);
+            return colorCache[url];
+        };
+
+        // Materiali raccolti per nome al caricamento, + base color originale per il reset
+        const materialsByName = {};   // nome materiale -> material
+        const defaultColorMap = {};   // nome materiale -> texture base color originale del GLB
+
+        window.updateBaseColor = (map1Url, map2Url) => {
+            if (!airpodsModel) return;
+            const tex1 = getColorTexture(map1Url);
+            const tex2 = getColorTexture(map2Url);
+            for (const name in materialsByName) {
+                const isBaking1 = (name === 'baking');
+                const url = isBaking1 ? map1Url : map2Url;
+                materialsByName[name].map = isBaking1 ? tex1 : tex2; // baking 2 / baking 3 -> set 2
+                // Schiarimento mirato SOLO per blu2.png: il .color moltiplica la
+                // texture. Per ogni altro colore lo riportiamo a bianco (neutro).
+                if (url === 'blu2.png') {
+                    materialsByName[name].color.setScalar(BLU2_LIGHTEN);
+                } else {
+                    materialsByName[name].color.setScalar(1.0);
+                }
+                materialsByName[name].needsUpdate = true;
+            }
+        };
+
+        // Reset: ripristina le base color originali bakate nel GLB
+        window.resetColors = () => {
+            if (!airpodsModel) return;
+            for (const name in materialsByName) {
+                materialsByName[name].map = defaultColorMap[name] || null;
+                materialsByName[name].needsUpdate = true;
+            }
+        };
+
+        const loader = new GLTFLoader();
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+        loader.setDRACOLoader(dracoLoader);
+
+        // Modello compresso con Draco (passato dal glTF reviewer). Il DRACOLoader
+        // sopra lo decodifica trasparentemente: nessun'altra modifica necessaria.
+        loader.load('cuffie-v1 (2).glb', (gltf) => {
+            airpodsModel = gltf.scene;
+            const box = new THREE.Box3().setFromObject(airpodsModel);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            airpodsModel.position.sub(center);
+            scene.add(airpodsModel);
+
+            airpodsModel.traverse((child) => {
+                if (!child.isMesh) return;
+
+                // Una mesh puo' avere uno o piu' materiali (array)
+                const mats = Array.isArray(child.material) ? child.material : [child.material];
+
+                for (const mat of mats) {
+                    if (!mat) continue;
+                    const name = mat.name;
+
+                    // Registra il materiale per nome (per picker e reset)
+                    materialsByName[name] = mat;
+                    if (defaultColorMap[name] === undefined) defaultColorMap[name] = mat.map || null;
+
+                    // Materiali morbidi/opachi (NON metallici, niente clearcoat):
+                    //  - baking 2 = rete/cuscinetti
+                    //  - baking 3 = tessuto dietro la rete. Trattarlo come lucido
+                    //    metallico faceva riflettere le striature dell'environment,
+                    //    che attraverso i buchi della rete apparivano come puntini.
+                    const isMorbido = (name === 'baking 2' || name === 'baking 3');
+
+                    // --- AGGANCIO ORM in base al nome del materiale ---
+                    const orm = ORM_BY_MATERIAL[name];
+                    if (orm) {
+                        // ORM packed glTF: R=AO, G=Roughness, B=Metalness
+                        mat.aoMap = orm;
+                        mat.aoMapIntensity = 1.0;
+                        if (isMorbido) {
+                            // Tessuto/rete: NON metallico, ruvido, opaco. Niente
+                            // metalnessMap (era il riflesso "meccanico"), roughness
+                            // piena = superficie diffusa, nessun riflesso speculare
+                            // netto -> niente puntini delle striature.
+                            mat.metalnessMap = null;
+                            mat.metalness = 0.0;
+                            mat.roughnessMap = orm;   // usa solo il canale roughness
+                            mat.roughness = 1.0;
+                        } else {
+                            // Parti rigide (baking): la ORM controlla metallo +
+                            // roughness. metalnessFactor del GLB e' 0, quindi
+                            // rimettiamo a 1 o la metalnessMap viene azzerata.
+                            mat.roughnessMap = orm;
+                            mat.metalnessMap = orm;
+                            mat.metalness = 1.0;
+                            mat.roughness = 1.0;
+                        }
+                    }
+
+                    // Migliora la nitidezza e ATTIVA L'ANTIALIASING sulle texture
+                    // gia' presenti nel GLB (normal/color). Senza mipmap, la normal
+                    // map ad alta frequenza causa i blocchi-mosaico sul metallo da
+                    // lontano. Le forziamo qui perche' arrivano dal GLTFLoader.
+                    const maxAniso = renderer.capabilities.getMaxAnisotropy();
+                    for (const t of [mat.map, mat.normalMap, mat.roughnessMap, mat.metalnessMap, mat.aoMap]) {
+                        if (!t) continue;
+                        t.anisotropy = maxAniso;
+                        t.generateMipmaps = true;
+                        t.minFilter = THREE.LinearMipmapLinearFilter;
+                        t.magFilter = THREE.LinearFilter;
+                        t.needsUpdate = true;
+                    }
+
+                    if (isMorbido) {
+                        // Tessuto/rete morbidi e opachi: niente clearcoat, niente
+                        // trasparenza, riflessi ambientali tenui (no puntini speculari).
+                        mat.transparent = false;
+                        mat.alphaTest = 0.0;
+                        mat.alphaMap = null;
+                        mat.depthWrite = true;
+                        mat.clearcoat = 0.0;
+                        mat.side = THREE.DoubleSide; // la rete e' doubleSided nel GLB
+                        mat.envMapIntensity = 0.4;   // opaco diffuso: riflessi molto tenui
+
+                        if (name === 'baking 3') {
+                            // baking 3 ha la trama forata: ripristiniamo il ritaglio
+                            // netto leggendo il canale alpha della sua base color
+                            // ('colore2-alpha', gia' caricata dal GLB). alphaTest =
+                            // taglio secco -> nessun problema di ordinamento/blending.
+                            mat.alphaTest = 0.5;
+                            mat.transparent = false; // alphaTest non richiede blending
+                            mat.depthWrite = true;
+                        }
+                    } else {
+                        // --- CLEARCOAT sulle parti lucide (vernice trasparente, look Apple) ---
+                        mat.clearcoat = 1.0;
+                        mat.clearcoatRoughness = 0.08;
+                        if (mat.normalMap) {
+                            mat.clearcoatNormalMap = mat.normalMap;
+                            mat.clearcoatNormalScale = new THREE.Vector2(0.3, 0.3);
+                        }
+                        mat.envMapIntensity = 1.3; // fa risaltare le striature sul metallo
+                    }
+
+                    mat.needsUpdate = true;
+
+                    // Lift delle ombre della base color: recupera dettaglio nel nero
+                    // di colore1 (baking) e colore2 (baking 2 / baking 3).
+                    applyShadowLift(mat, 0.04);
+                }
+
+                // UV2 per l'aoMap del GTAO: usa TEXCOORD_1 se c'e', altrimenti TEXCOORD_0
+                if (child.geometry && child.geometry.attributes.uv && !child.geometry.attributes.uv2) {
+                    child.geometry.setAttribute('uv2', child.geometry.attributes.uv);
+                }
+            });
+
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            camera.position.set(0, size.y * 0.15, maxDim * 2.2);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        });
+
+        // ============================================================
+        //  RENDERING DIRETTO (niente EffectComposer)
+        //  Il post-processing via composer corrompeva l'alpha del canvas
+        //  trasparente e ri-tonemappava lo sfondo. Renderizzando direttamente,
+        //  il canvas resta trasparente e mostra il div #bg-gradient esatto,
+        //  mentre il prodotto e' renderizzato con ACES dal renderer.
+        //  (Bloom e vignetta rimossi: erano effetti minori che richiedevano il
+        //   composer; il look resta determinato da environment + materiali.)
+        // ============================================================
+        // ============================================================
+        //  CONTROLLI LUCI (UI)
+        //  Toggle 180/360 e slider rotazione: al cambio rigenerano
+        //  l'environment. La rigenerazione e' rapida (cubemap + PMREM).
+        // ============================================================
+        const modeBtn = document.getElementById('mode-btn');
+        const rotSlider = document.getElementById('rot-slider');
+        const rotVal = document.getElementById('rot-val');
+
+        modeBtn.addEventListener('click', () => {
+            lightMode = (lightMode === 180) ? 360 : 180;
+            modeBtn.textContent = lightMode + '\u00b0';
+            regenerateEnvironment();
+        });
+
+        // Durante il drag dello slider rigeneriamo in tempo reale. Per non
+        // generare a ogni singolo pixel, usiamo un piccolo throttle via rAF.
+        let rotPending = false;
+        rotSlider.addEventListener('input', () => {
+            lightRotation = parseInt(rotSlider.value, 10);
+            rotVal.textContent = lightRotation + '\u00b0';
+            if (!rotPending) {
+                rotPending = true;
+                requestAnimationFrame(() => {
+                    regenerateEnvironment();
+                    rotPending = false;
+                });
+            }
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            const w = window.innerWidth, h = window.innerHeight;
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+        });
+    </script>
+</body>
+</html>

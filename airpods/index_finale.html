@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Visualizzatore AirPods</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+        canvas { display: block; position: relative; z-index: 1; background: transparent !important; }
+        /* Sfondo come layer DOM dietro il canvas trasparente. Il background NON puo'
+           stare nella scena perche' il RenderPass applica ACES anche ad esso
+           (#fff diventa #e8). Tenendolo in DOM resta esatto: #fff -> #dedede. */
+        #bg-gradient {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            background-image: linear-gradient(#fff 50%, #dedede);
+        }
+
+        #color-picker {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 10;
+        }
+        .dot {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            cursor: pointer;
+            border: 2px solid rgba(0,0,0,0.15);
+            transition: transform 0.2s;
+        }
+        .dot:hover { transform: scale(1.1); }
+    </style>
+</head>
+<body>
+
+    <div id="bg-gradient"></div>
+
+    <div id="color-picker">
+        <div class="dot" style="background-color: #424240;" onclick="resetColors()"></div>
+        <div class="dot" style="background-color: #ECE4D9;" onclick="updateBaseColor('bianco1.png', 'bianco2.png')"></div>
+        <div class="dot" style="background-color: #F7BEA2;" onclick="updateBaseColor('rosa1.png', 'rosa2.png')"></div>
+        <div class="dot" style="background-color: #7E8FA0;" onclick="updateBaseColor('blu1.png', 'blu2.png')"></div>
+        <div class="dot" style="background-color: #B5C3B1;" onclick="updateBaseColor('verde1.png', 'verde2.png')"></div>
+        <div class="dot" style="background-color: #BDB4C9;" onclick="updateBaseColor('viola1.png', 'viola2.png')"></div>
+        <div class="dot" style="background-color: #B8615A;" onclick="updateBaseColor('rosso1.png', 'rosso2.png')"></div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ============================================================
+        //  SCENA
+        //  Niente piani d'appoggio: il prodotto fluttua nel vuoto.
+        // ============================================================
+        const scene = new THREE.Scene();
+        // Nessuno sfondo nella scena: il canvas e' trasparente e mostra il div
+        // #bg-gradient dietro. Cosi' il gradiente NON passa per il RenderPass
+        // (che applicherebbe ACES) e resta esatto.
+        scene.background = null;
+
+        const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, premultipliedAlpha: false });
+        renderer.setClearColor(0x000000, 0); // alpha 0 = canvas trasparente
+        renderer.setClearAlpha(0);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        // ACES: resa fotografica, gestisce bene gli highlight speculari delle superfici lucide
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.0;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        // Solo rotazione: niente zoom, niente pan (spostamento laterale).
+        controls.enableZoom = false;
+        controls.enablePan = false;
+
+        // ============================================================
+        //  ENVIRONMENT STUDIO CUSTOM — "vetrina Apple Store"
+        //  Strisce verticali emissive (softbox a colonna) su fondo scuro.
+        //  I riflessi ad alto contrasto fanno leggere le superfici come metallo.
+        //  ZERO download: generato col PMREMGenerator.
+        // ============================================================
+        function buildStudioEnvironment(mode, rotationDeg) {
+            const envScene = new THREE.Scene();
+            envScene.background = new THREE.Color(0x1a1a1e);
+
+            const makePanel = (w, h, intensity, color = 0xffffff) => {
+                const mat = new THREE.MeshBasicMaterial({ color });
+                mat.color.multiplyScalar(intensity);
+                return new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+            };
+
+            const RADIUS = 7;
+            const rot = rotationDeg || 0; // offset angolare delle softbox
+
+            const addStripe = (angleDeg, w, h, i, color = 0xffffff) => {
+                const panel = makePanel(w, h, i, color);
+                const rad = THREE.MathUtils.degToRad(angleDeg + rot);
+                panel.position.set(Math.sin(rad) * RADIUS, 0, Math.cos(rad) * RADIUS);
+                panel.lookAt(0, 0, 0);
+                envScene.add(panel);
+            };
+
+            if (mode === 360) {
+                const data360 = [
+                    { a:   0, w: 2.0, h: 10, i: 4.5 }, { a:  30, w: 0.7, h: 9, i: 6.0 },
+                    { a:  60, w: 1.5, h: 9,  i: 3.5 }, { a:  90, w: 1.0, h: 9, i: 5.0 },
+                    { a: 120, w: 1.8, h: 9,  i: 3.8 }, { a: 150, w: 0.7, h: 8, i: 5.5 },
+                    { a: 180, w: 2.0, h: 10, i: 4.0 }, { a: 210, w: 0.8, h: 9, i: 5.5 },
+                    { a: 240, w: 1.6, h: 9,  i: 3.8 }, { a: 270, w: 1.0, h: 9, i: 5.0 },
+                    { a: 300, w: 1.7, h: 9,  i: 3.8 }, { a: 330, w: 0.7, h: 9, i: 6.0 },
+                ];
+                for (const s of data360) addStripe(s.a, s.w, s.h, s.i);
+            } else {
+                // --- 180°: softbox ad arco su davanti/lati ---
+                const data180 = [
+                    { a: -55, w: 1.4, h: 9, i: 3.5 }, { a: -28, w: 0.7, h: 9,  i: 5.0 },
+                    { a:  -8, w: 2.2, h: 10, i: 4.0 }, { a:  15, w: 0.6, h: 9, i: 6.0 },
+                    { a:  40, w: 1.6, h: 9, i: 3.5 }, { a:  70, w: 0.9, h: 8,  i: 4.5 },
+                ];
+                for (const s of data180) addStripe(s.a, s.w, s.h, s.i);
+                addStripe(150, 1.0, 8, 2.5, 0xdfe8ff);
+                addStripe(205, 1.2, 8, 2.8, 0xdfe8ff);
+            }
+
+            const top = makePanel(14, 14, 1.4);
+            top.rotation.x = Math.PI / 2;
+            top.position.set(0, 6, 0);
+            envScene.add(top);
+
+            const bottom = makePanel(12, 12, 0.5);
+            bottom.rotation.x = -Math.PI / 2;
+            bottom.position.set(0, -6, 0);
+            envScene.add(bottom);
+
+            return envScene;
+        }
+
+        // ============================================================
+        //  GENERAZIONE ENVIRONMENT AD ALTA RISOLUZIONE
+        //  Cattura la scena-studio in un CubeRenderTarget ad alta risoluzione
+        //  e la converte in mappa PMREM -> riflessi continui anche da lontano.
+        //  SETUP FISSO: luci 180°, origine ruotata di 180° (lato opposto al
+        //  default). Per sperimentare modalita'/rotazione usa la versione con
+        //  lo slider (index_realistico_draco.html).
+        // ============================================================
+        const ENV_RES = 1024;
+        const LIGHT_MODE = 180;       // 180 o 360
+        const LIGHT_ROTATION = 180;   // offset origine luci, in gradi
+
+        const studioEnv = buildStudioEnvironment(LIGHT_MODE, LIGHT_ROTATION);
+        const cubeRT = new THREE.WebGLCubeRenderTarget(ENV_RES, {
+            type: THREE.HalfFloatType,
+            minFilter: THREE.LinearMipmapLinearFilter,
+            generateMipmaps: true,
+        });
+        const cubeCam = new THREE.CubeCamera(0.1, 100, cubeRT);
+        cubeCam.update(renderer, studioEnv);
+
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        pmrem.compileCubemapShader();
+        const envRT = pmrem.fromCubemap(cubeRT.texture);
+        scene.environment = envRT.texture;
+        scene.environmentIntensity = 1.25;
+        pmrem.dispose();
+        cubeRT.dispose();
+
+        // ============================================================
+        //  LUCI — tre punti morbidi per transizioni luce/ombra graduali.
+        // ============================================================
+        const keyLight = new THREE.DirectionalLight(0xffffff, 1.4);
+        keyLight.position.set(5, 7, 6);
+        scene.add(keyLight);
+
+        const rimLight = new THREE.DirectionalLight(0xdfe8ff, 0.9);
+        rimLight.position.set(-6, 4, -5);
+        scene.add(rimLight);
+
+        const fillLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        fillLight.position.set(-2, -3, 4);
+        scene.add(fillLight);
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+        const textureLoader = new THREE.TextureLoader();
+        let airpodsModel = null;
+        // Dimensioni del modello, salvate al caricamento per ricalcolare la
+        // distanza camera anche al resize.
+        let modelMaxDim = 1;
+        let modelHeight = 1;
+
+        // Posiziona la camera in base alla larghezza schermo: su mobile (stretto)
+        // piu' lontana = modello meno zoomato. Richiamata al load e al resize.
+        function applyCameraDistance() {
+            const isMobile = window.innerWidth < 600;
+            const dist = modelMaxDim * (isMobile ? 3.1 : 2.45);
+            // lato opposto (z negativo), decentrato verso DESTRA (x negativo),
+            // lieve inclinazione dall'alto.
+            camera.position.set(-dist * 0.35, modelHeight * 0.2, -dist * 0.92);
+            controls.update();
+        }
+
+        const loadTexture = (url, isSRGB = true) => {
+            const tex = textureLoader.load(url);
+            tex.flipY = false;
+            tex.colorSpace = isSRGB ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+            tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            tex.generateMipmaps = true;
+            tex.minFilter = THREE.LinearMipmapLinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.needsUpdate = true;
+            return tex;
+        };
+
+        // ============================================================
+        //  ORM — agganciate per NOME materiale (baking -> orm1, baking 2/3 -> orm2)
+        // ============================================================
+        const orm1 = loadTexture('orm1.png', false);
+        const orm2 = loadTexture('orm2.png', false);
+
+        // Shadow lift: solleva le sole ombre della base color (nero meno schiacciato)
+        function applyShadowLift(mat, amount = 0.1) {
+            mat.onBeforeCompile = (shader) => {
+                shader.uniforms.uShadowLift = { value: amount };
+                shader.fragmentShader = shader.fragmentShader
+                    .replace(
+                        'uniform float opacity;',
+                        'uniform float opacity;\nuniform float uShadowLift;'
+                    )
+                    .replace(
+                        '#include <map_fragment>',
+                        `#include <map_fragment>
+                        {
+                            float luma = dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+                            float shadowWeight = 1.0 - smoothstep(0.0, 0.05, luma);
+                            diffuseColor.rgb += uShadowLift * shadowWeight;
+                        }`
+                    );
+            };
+            mat.needsUpdate = true;
+        }
+
+        const ORM_BY_MATERIAL = {
+            'baking':   orm1,
+            'baking 2': orm2,
+            'baking 3': orm2,
+        };
+
+        // ============================================================
+        //  PICKER — cambia SOLO la base color (swap rapido, texture in cache).
+        //  '...1.png' -> 'baking'; '...2.png' -> 'baking 2' e 'baking 3'.
+        // ============================================================
+        const BLU2_LIGHTEN = 1.05; // schiarimento mirato per blu2.png
+
+        const colorCache = {};
+        const getColorTexture = (url) => {
+            if (!colorCache[url]) colorCache[url] = loadTexture(url, true);
+            return colorCache[url];
+        };
+
+        const materialsByName = {};
+        const defaultColorMap = {};
+
+        window.updateBaseColor = (map1Url, map2Url) => {
+            if (!airpodsModel) return;
+            const tex1 = getColorTexture(map1Url);
+            const tex2 = getColorTexture(map2Url);
+            for (const name in materialsByName) {
+                const isBaking1 = (name === 'baking');
+                const url = isBaking1 ? map1Url : map2Url;
+                materialsByName[name].map = isBaking1 ? tex1 : tex2;
+                if (url === 'blu2.png') {
+                    materialsByName[name].color.setScalar(BLU2_LIGHTEN);
+                } else {
+                    materialsByName[name].color.setScalar(1.0);
+                }
+                materialsByName[name].needsUpdate = true;
+            }
+        };
+
+        window.resetColors = () => {
+            if (!airpodsModel) return;
+            for (const name in materialsByName) {
+                materialsByName[name].map = defaultColorMap[name] || null;
+                materialsByName[name].needsUpdate = true;
+            }
+        };
+
+        const loader = new GLTFLoader();
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+        loader.setDRACOLoader(dracoLoader);
+
+        loader.load('cuffie-v1 (2).glb', (gltf) => {
+            airpodsModel = gltf.scene;
+            const box = new THREE.Box3().setFromObject(airpodsModel);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            airpodsModel.position.sub(center);
+            scene.add(airpodsModel);
+
+            airpodsModel.traverse((child) => {
+                if (!child.isMesh) return;
+
+                const mats = Array.isArray(child.material) ? child.material : [child.material];
+
+                for (const mat of mats) {
+                    if (!mat) continue;
+                    const name = mat.name;
+
+                    materialsByName[name] = mat;
+                    if (defaultColorMap[name] === undefined) defaultColorMap[name] = mat.map || null;
+
+                    // baking 2 = rete; baking 3 = tessuto dietro la rete (entrambi morbidi/opachi)
+                    const isMorbido = (name === 'baking 2' || name === 'baking 3');
+
+                    const orm = ORM_BY_MATERIAL[name];
+                    if (orm) {
+                        mat.aoMap = orm;
+                        mat.aoMapIntensity = 1.0;
+                        if (isMorbido) {
+                            mat.metalnessMap = null;
+                            mat.metalness = 0.0;
+                            mat.roughnessMap = orm;
+                            mat.roughness = 1.0;
+                        } else {
+                            mat.roughnessMap = orm;
+                            mat.metalnessMap = orm;
+                            mat.metalness = 1.0;
+                            mat.roughness = 1.0;
+                        }
+                    }
+
+                    const maxAniso = renderer.capabilities.getMaxAnisotropy();
+                    for (const t of [mat.map, mat.normalMap, mat.roughnessMap, mat.metalnessMap, mat.aoMap]) {
+                        if (!t) continue;
+                        t.anisotropy = maxAniso;
+                        t.generateMipmaps = true;
+                        t.minFilter = THREE.LinearMipmapLinearFilter;
+                        t.magFilter = THREE.LinearFilter;
+                        t.needsUpdate = true;
+                    }
+
+                    if (isMorbido) {
+                        mat.transparent = false;
+                        mat.alphaTest = 0.0;
+                        mat.alphaMap = null;
+                        mat.depthWrite = true;
+                        mat.clearcoat = 0.0;
+                        mat.side = THREE.DoubleSide;
+                        mat.envMapIntensity = 0.4;
+
+                        if (name === 'baking 3') {
+                            // trama forata: ritaglio netto via canale alpha della base color
+                            mat.alphaTest = 0.5;
+                            mat.transparent = false;
+                            mat.depthWrite = true;
+                        }
+                    } else {
+                        // clearcoat sulle parti lucide (look Apple)
+                        mat.clearcoat = 1.0;
+                        mat.clearcoatRoughness = 0.08;
+                        if (mat.normalMap) {
+                            mat.clearcoatNormalMap = mat.normalMap;
+                            mat.clearcoatNormalScale = new THREE.Vector2(0.3, 0.3);
+                        }
+                        mat.envMapIntensity = 1.3;
+                    }
+
+                    mat.needsUpdate = true;
+                    applyShadowLift(mat, 0.04);
+                }
+
+                if (child.geometry && child.geometry.attributes.uv && !child.geometry.attributes.uv2) {
+                    child.geometry.setAttribute('uv2', child.geometry.attributes.uv);
+                }
+            });
+
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            modelMaxDim = maxDim;
+            modelHeight = size.y;
+            applyCameraDistance(); // posiziona la camera in base alla larghezza schermo
+            controls.target.set(0, 0, 0);
+            controls.update();
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            const w = window.innerWidth, h = window.innerHeight;
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+            if (airpodsModel) applyCameraDistance(); // ricalcola lo zoom per la nuova larghezza
+        });
+    </script>
+</body>
+</html>
