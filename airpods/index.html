@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Visualizzatore AirPods</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #ffffff; }
+        canvas { display: block; }
+        
+        #color-picker {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 10;
+        }
+        .dot {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            cursor: pointer;
+            border: 2px solid #ccc;
+            transition: transform 0.2s;
+        }
+        .dot:hover { transform: scale(1.1); }
+    </style>
+</head>
+<body>
+
+    <div id="color-picker">
+        <div class="dot" style="background-color: #000000;" onclick="resetColors()"></div>
+        <div class="dot" style="background-color: #ffffff;" onclick="updateBaseColor('bianco1.png', 'bianco2.png')"></div>
+        <div class="dot" style="background-color: #ffc0cb;" onclick="updateBaseColor('rosa1.png', 'rosa2.png')"></div>
+        <div class="dot" style="background-color: #87ceeb;" onclick="updateBaseColor('blu1.png', 'blu2.png')"></div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+        import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xffffff);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ReinhardToneMapping;
+        renderer.toneMappingExposure = 1.5;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        const textureLoader = new THREE.TextureLoader();
+        let airpodsModel = null;
+
+        const loadTexture = (url, isSRGB = true) => {
+            const tex = textureLoader.load(url);
+            tex.flipY = false;
+            tex.colorSpace = isSRGB ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+            return tex;
+        };
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+        scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+
+        new EXRLoader().load('studio.exr', (texture) => {
+            texture.mapping = THREE.EquirectangularReflectionMapping;
+            scene.environment = texture;
+            scene.environmentIntensity = 1.0;
+        });
+
+        const orm1 = loadTexture('orm1.png', false);
+        const orm2 = loadTexture('orm2.png', false);
+
+        // Funzione per aggiornare SOLO la mappa colore
+        window.updateBaseColor = (map1Url, map2Url) => {
+            if (!airpodsModel) return;
+            const newMap1 = loadTexture(map1Url);
+            const newMap2 = loadTexture(map2Url);
+
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.map = (child.name === 'destra_low') ? newMap1 : newMap2;
+                    child.material.needsUpdate = true;
+                }
+            });
+        };
+
+        // Funzione per resettare (ritorno allo stato iniziale del GLTF)
+        window.resetColors = () => {
+            if (!airpodsModel) return;
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    // Impostando map a null, Three.js usa il colore del materiale o la texture originale del file
+                    child.material.map = null; 
+                    child.material.needsUpdate = true;
+                }
+            });
+        };
+
+        const loader = new GLTFLoader();
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+        loader.setDRACOLoader(dracoLoader);
+
+        loader.load('cuffie.glb', (gltf) => {
+            airpodsModel = gltf.scene;
+            const box = new THREE.Box3().setFromObject(airpodsModel);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            airpodsModel.position.sub(center);
+            scene.add(airpodsModel);
+
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    const mat = child.material;
+                    const targetMap = (child.name === 'destra_low') ? orm1 : orm2;
+                    
+                    mat.aoMap = targetMap;
+                    mat.roughnessMap = targetMap;
+                    mat.metalnessMap = targetMap;
+                    mat.aoMapIntensity = 1.0;
+                    mat.roughness = 1.0;
+                    mat.metalness = 1.0;
+
+                    if (child.name === 'tessuto') {
+                        mat.transparent = true;
+                        mat.alphaTest = 0.5;
+                        mat.side = THREE.DoubleSide;
+                    }
+                    mat.needsUpdate = true;
+                }
+            });
+            camera.position.z = Math.max(box.getSize(new THREE.Vector3()).z) * 2.5;
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>

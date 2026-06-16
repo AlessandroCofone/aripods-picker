@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Visualizzatore AirPods — Path Traced</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #ffffff; }
+        canvas { display: block; }
+
+        #color-picker {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 10;
+        }
+        .dot {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            cursor: pointer;
+            border: 2px solid #ccc;
+            transition: transform 0.2s;
+        }
+        .dot:hover { transform: scale(1.1); }
+
+        #status {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            z-index: 10;
+            font-family: -apple-system, system-ui, sans-serif;
+            font-size: 12px;
+            color: #888;
+            background: rgba(255,255,255,0.7);
+            padding: 4px 10px;
+            border-radius: 6px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="status">Inizializzazione…</div>
+
+    <div id="color-picker">
+        <div class="dot" style="background-color: #000000;" onclick="resetColors()"></div>
+        <div class="dot" style="background-color: #ffffff;" onclick="updateBaseColor('bianco1.png', 'bianco2.png')"></div>
+        <div class="dot" style="background-color: #ffc0cb;" onclick="updateBaseColor('rosa1.png', 'rosa2.png')"></div>
+        <div class="dot" style="background-color: #87ceeb;" onclick="updateBaseColor('blu1.png', 'blu2.png')"></div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.163.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/",
+                "three/examples/jsm/": "https://unpkg.com/three@0.163.0/examples/jsm/",
+                "three-mesh-bvh": "https://unpkg.com/three-mesh-bvh@0.7.3/build/index.module.js",
+                "three-gpu-pathtracer": "https://unpkg.com/three-gpu-pathtracer@0.0.24/build/index.module.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+        import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { WebGLPathTracer, BlurredEnvMapGenerator } from 'three-gpu-pathtracer';
+
+        const statusEl = document.getElementById('status');
+        const setStatus = (t) => { statusEl.textContent = t; };
+
+        // --- SCENA / CAMERA / RENDERER ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xffffff);
+        // Il path tracer legge scene.environmentRotation come Euler: inizializzala
+        // esplicitamente per evitare crash in updateEnvironment().
+        scene.environmentRotation = new THREE.Euler();
+        scene.backgroundRotation = new THREE.Euler();
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.1;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+
+        // --- PATH TRACER ---
+        const pathTracer = new WebGLPathTracer(renderer);
+        pathTracer.bounces = 8;             // rimbalzi luce: piu' alto = piu' realismo, piu' lento
+        pathTracer.minSamples = 1;          // mostra presto, il fade copre la prima convergenza
+        pathTracer.renderScale = 1.0;       // scala di rendering (abbassa per piu' velocita')
+        pathTracer.fadeDuration = 500;      // durata della dissolvenza raster -> path traced (ms)
+        pathTracer.tiles.set(2, 2);         // suddivisione in tile: piu' reattivo su scene pesanti
+        // OTTIMIZZAZIONE PESO: il path tracer impacchetta TUTTE le mappe in un texture
+        // array a questa risoluzione. Default 1024 = ~88 MB VRAM con le tue ~22 mappe.
+        // 512 lo porta a ~22 MB (1/4) con perdita di dettaglio trascurabile su un
+        // oggetto piccolo come gli AirPods. Metti 256 se serve ancora piu' leggero.
+        pathTracer.textureSize = new THREE.Vector2(512, 512);
+        // rasterizeScene + renderToCanvas: durante la convergenza il path tracer
+        // mostra la scena rasterizzata e dissolve verso l'immagine pulita.
+        pathTracer.rasterizeScene = true;
+        pathTracer.renderToCanvas = true;
+
+        const textureLoader = new THREE.TextureLoader();
+        let airpodsModel = null;
+        let sceneReady = false;
+
+        const loadTexture = (url, isSRGB = true) => {
+            const tex = textureLoader.load(url);
+            tex.flipY = false;
+            tex.colorSpace = isSRGB ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+            return tex;
+        };
+
+        // --- ENVIRONMENT: e' la fonte di luce del path tracer ---
+        // Una versione leggermente sfocata dell'HDRI fa convergere il path tracer
+        // molto piu' in fretta (meno rumore da risolvere), a costo di riflessi
+        // ambientali un filo meno nitidi. Ottimo compromesso per alleggerire.
+        const envBlurGenerator = new BlurredEnvMapGenerator(renderer);
+        new EXRLoader().load('studio.exr', (texture) => {
+            texture.mapping = THREE.EquirectangularReflectionMapping;
+            const blurred = envBlurGenerator.generate(texture, 0.2); // 0 = nitido, 0.35 = molto soft
+            scene.environment = blurred;
+            scene.environmentIntensity = 1.2;
+            texture.dispose();
+            if (sceneReady) rebuildScene();
+        });
+
+        const orm1 = loadTexture('orm1.png', false);
+        const orm2 = loadTexture('orm2.png', false);
+
+        const ROUGHNESS = 0.9;
+
+        // Ricostruisce la scena nel path tracer e fa ripartire l'accumulo.
+        // Va chiamata ad ogni cambio di geometria, materiali o environment.
+        function rebuildScene() {
+            pathTracer.setScene(scene, camera);
+            setStatus('Rendering…');
+        }
+
+        // --- CAMBIO COLORE: aggiorna le mappe e ricostruisce ---
+        window.updateBaseColor = (map1Url, map2Url) => {
+            if (!airpodsModel) return;
+            const newMap1 = loadTexture(map1Url);
+            const newMap2 = loadTexture(map2Url);
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.map = (child.name === 'destra_low') ? newMap1 : newMap2;
+                    child.material.needsUpdate = true;
+                }
+            });
+            rebuildScene();
+        };
+
+        window.resetColors = () => {
+            if (!airpodsModel) return;
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.map = null;
+                    child.material.needsUpdate = true;
+                }
+            });
+            rebuildScene();
+        };
+
+        // --- CARICAMENTO MODELLO ---
+        const loader = new GLTFLoader();
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+        loader.setDRACOLoader(dracoLoader);
+
+        loader.load('cuffie.glb', (gltf) => {
+            airpodsModel = gltf.scene;
+            const box = new THREE.Box3().setFromObject(airpodsModel);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            airpodsModel.position.sub(center);
+            scene.add(airpodsModel);
+
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    const mat = child.material;
+                    const targetMap = (child.name === 'destra_low') ? orm1 : orm2;
+
+                    mat.aoMap = targetMap;
+                    mat.roughnessMap = targetMap;
+                    mat.metalnessMap = targetMap;
+                    mat.aoMapIntensity = 1.0;
+                    mat.roughness = ROUGHNESS;
+                    mat.metalness = 1.0;
+                    mat.envMapIntensity = 1.2;
+
+                    if (child.name === 'tessuto') {
+                        mat.transparent = true;
+                        mat.alphaTest = 0.5;
+                        mat.side = THREE.DoubleSide;
+                    }
+                    mat.needsUpdate = true;
+                }
+            });
+
+            const size = box.getSize(new THREE.Vector3());
+            camera.position.set(0, size.y * 0.3, Math.max(size.z, size.x) * 2.5);
+            controls.target.set(0, 0, 0);
+            controls.update();
+
+            sceneReady = true;
+            rebuildScene();
+        });
+
+        // --- LOOP CON CONVERGENZA DIETRO FADE ---
+        // Mentre la camera si muove (rotazione O zoom O pan): render rasterizzato di
+        // three (pulito, istantaneo, leggerissimo). Il path tracing parte SOLO quando
+        // la camera e' davvero stabile, confrontando posizione e distanza frame per
+        // frame. Questo evita che lo zoom (raffica di eventi + inerzia del damping)
+        // resetti la convergenza all'infinito rendendo tutto pesantissimo.
+        const lastPos = new THREE.Vector3();
+        const lastTarget = new THREE.Vector3();
+        let lastDist = 0;
+        let stillFrames = 0;
+        let pathTracingActive = false;
+        const STILL_FRAMES_NEEDED = 12;   // frame consecutivi fermi prima di iniziare (~0.2s)
+        const MOVE_EPSILON = 0.0008;      // soglia sotto cui consideriamo la camera ferma
+
+        function cameraIsStill() {
+            const dPos = camera.position.distanceToSquared(lastPos);
+            const dTgt = controls.target.distanceToSquared(lastTarget);
+            const dDist = Math.abs(camera.position.distanceTo(controls.target) - lastDist);
+            lastPos.copy(camera.position);
+            lastTarget.copy(controls.target);
+            lastDist = camera.position.distanceTo(controls.target);
+            return dPos < MOVE_EPSILON && dTgt < MOVE_EPSILON && dDist < MOVE_EPSILON;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            if (!sceneReady) {
+                renderer.render(scene, camera);
+                return;
+            }
+
+            if (cameraIsStill()) {
+                stillFrames++;
+            } else {
+                stillFrames = 0;
+                pathTracingActive = false;
+                setStatus('Anteprima');
+            }
+
+            if (stillFrames < STILL_FRAMES_NEEDED) {
+                // Camera ancora in movimento (o damping residuo): raster fluido
+                renderer.render(scene, camera);
+            } else {
+                // Camera stabile: avvia/continua il path tracing
+                if (!pathTracingActive) {
+                    pathTracingActive = true;
+                    pathTracer.updateCamera();   // ricalibra e fa ripartire l'accumulo UNA volta
+                    setStatus('Rendering…');
+                }
+                pathTracer.renderSample();
+                const s = Math.floor(pathTracer.samples);
+                if (s >= 1) setStatus('Campioni: ' + s);
+            }
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            stillFrames = 0;
+            pathTracingActive = false;
+            if (sceneReady) pathTracer.updateCamera();
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Visualizzatore AirPods</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #ffffff; }
+        canvas { display: block; }
+
+        #color-picker {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 10;
+        }
+        .dot {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            cursor: pointer;
+            border: 2px solid #ccc;
+            transition: transform 0.2s;
+        }
+        .dot:hover { transform: scale(1.1); }
+    </style>
+</head>
+<body>
+
+    <div id="color-picker">
+        <div class="dot" style="background-color: #000000;" onclick="resetColors()"></div>
+        <div class="dot" style="background-color: #ffffff;" onclick="updateBaseColor('bianco1.png', 'bianco2.png')"></div>
+        <div class="dot" style="background-color: #ffc0cb;" onclick="updateBaseColor('rosa1.png', 'rosa2.png')"></div>
+        <div class="dot" style="background-color: #87ceeb;" onclick="updateBaseColor('blu1.png', 'blu2.png')"></div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+        import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { ProgressiveLightMap } from 'three/addons/misc/ProgressiveLightMap.js';
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xffffff);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.1;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+
+        const textureLoader = new THREE.TextureLoader();
+        let airpodsModel = null;
+
+        const loadTexture = (url, isSRGB = true) => {
+            const tex = textureLoader.load(url);
+            tex.flipY = false;
+            tex.colorSpace = isSRGB ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+            return tex;
+        };
+
+        // --- LUCI DA STUDIO (illuminazione, non ombra) ---
+        const fillLight = new THREE.DirectionalLight(0xffffff, 0.6);
+        fillLight.position.set(-6, 3, -4);
+        scene.add(fillLight);
+        scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+
+        // --- ENVIRONMENT: fonte primaria dei riflessi nitidi ---
+        new EXRLoader().load('studio.exr', (texture) => {
+            texture.mapping = THREE.EquirectangularReflectionMapping;
+            scene.environment = texture;
+            scene.environmentIntensity = 1.2;
+        });
+
+        // ============================================================
+        //   PROGRESSIVE CONTACT SHADOW
+        //   Ombra di contatto morbida accumulata da N direzioni di luce.
+        //   Si genera una sola volta all'avvio, mentre l'oggetto e' fermo.
+        //   Zero rumore una volta stabilizzata.
+        // ============================================================
+        const SHADOW_MAP_RES = 1024;   // risoluzione lightmap (qualita' ombra)
+        const SHADOW_SAMPLES = 400;     // n. di frame d'accumulo (piu' alto = piu' pulita)
+        const LIGHT_RADIUS = 4;         // ampiezza del "dome" di luci -> morbidezza ombra
+        const LIGHT_HEIGHT = 6;         // altezza media delle luci -> lunghezza ombra
+
+        const progressiveSurfacemap = new ProgressiveLightMap(renderer, SHADOW_MAP_RES);
+
+        // Piano che RICEVE l'ombra di contatto (la sua lightmap viene accumulata)
+        const shadowPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(8, 8),
+            new THREE.MeshStandardMaterial({
+                color: 0xffffff,
+                roughness: 1.0,
+                metalness: 0.0
+            })
+        );
+        shadowPlane.rotation.x = -Math.PI / 2;
+        shadowPlane.name = 'shadow-catcher';
+        scene.add(shadowPlane);
+
+        // Dome di luci virtuali: ad ogni frame d'accumulo vengono spostate a caso
+        // entro un'area circolare -> la media produce la penombra morbida.
+        const shadowLights = [];
+        const SHADOW_LIGHT_COUNT = 8;
+        for (let i = 0; i < SHADOW_LIGHT_COUNT; i++) {
+            const light = new THREE.DirectionalLight(0xffffff, 1.0 / SHADOW_LIGHT_COUNT);
+            light.position.set(0, LIGHT_HEIGHT, 0);
+            scene.add(light);
+            shadowLights.push(light);
+        }
+
+        let shadowAccumFrames = 0;
+        let shadowReady = false;
+
+        function startShadowAccumulation(objects) {
+            // Gli oggetti che proiettano l'ombra (le cuffie) + il piano ricevente
+            progressiveSurfacemap.addObjectsToLightMap([...objects, shadowPlane]);
+            shadowAccumFrames = 0;
+            shadowReady = false;
+        }
+
+        function randomiseShadowLights() {
+            for (const light of shadowLights) {
+                const a = Math.random() * Math.PI * 2;
+                const r = Math.sqrt(Math.random()) * LIGHT_RADIUS;
+                light.position.set(
+                    Math.cos(a) * r,
+                    LIGHT_HEIGHT + (Math.random() - 0.5) * 2,
+                    Math.sin(a) * r
+                );
+            }
+        }
+
+        const orm1 = loadTexture('orm1.png', false);
+        const orm2 = loadTexture('orm2.png', false);
+
+        const ROUGHNESS = 0.9;
+
+        window.updateBaseColor = (map1Url, map2Url) => {
+            if (!airpodsModel) return;
+            const newMap1 = loadTexture(map1Url);
+            const newMap2 = loadTexture(map2Url);
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.map = (child.name === 'destra_low') ? newMap1 : newMap2;
+                    child.material.needsUpdate = true;
+                }
+            });
+        };
+
+        window.resetColors = () => {
+            if (!airpodsModel) return;
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.map = null;
+                    child.material.needsUpdate = true;
+                }
+            });
+        };
+
+        const loader = new GLTFLoader();
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+        loader.setDRACOLoader(dracoLoader);
+
+        loader.load('cuffie.glb', (gltf) => {
+            airpodsModel = gltf.scene;
+            const box = new THREE.Box3().setFromObject(airpodsModel);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            airpodsModel.position.sub(center);
+            scene.add(airpodsModel);
+
+            const meshes = [];
+            airpodsModel.traverse((child) => {
+                if (child.isMesh) {
+                    const mat = child.material;
+                    const targetMap = (child.name === 'destra_low') ? orm1 : orm2;
+
+                    mat.aoMap = targetMap;
+                    mat.roughnessMap = targetMap;
+                    mat.metalnessMap = targetMap;
+                    mat.aoMapIntensity = 1.0;
+                    mat.roughness = ROUGHNESS;
+                    mat.metalness = 1.0;
+                    mat.envMapIntensity = 1.2;
+
+                    if (child.name === 'tessuto') {
+                        mat.transparent = true;
+                        mat.alphaTest = 0.5;
+                        mat.side = THREE.DoubleSide;
+                    }
+                    mat.needsUpdate = true;
+                    meshes.push(child);
+                }
+            });
+
+            // Appoggia il modello sul piano (base a y=0)
+            const box2 = new THREE.Box3().setFromObject(airpodsModel);
+            shadowPlane.position.y = box2.min.y + 0.001;
+
+            // Avvia l'accumulo dell'ombra di contatto
+            startShadowAccumulation(meshes);
+
+            const size = box.getSize(new THREE.Vector3());
+            camera.position.set(0, size.y * 0.3, Math.max(size.z, size.x) * 2.5);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            // Fase di accumulo ombra: gira solo i primi SHADOW_SAMPLES frame
+            if (airpodsModel && !shadowReady) {
+                if (shadowAccumFrames < SHADOW_SAMPLES) {
+                    randomiseShadowLights();
+                    // l'ultimo arg true = mostra direttamente la lightmap accumulata sul piano
+                    progressiveSurfacemap.update(camera, 50, true);
+                    shadowAccumFrames++;
+                } else {
+                    // Accumulo completo: "congela" il risultato, niente piu' ricalcolo
+                    shadowReady = true;
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
