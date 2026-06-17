@@ -17,29 +17,32 @@
             position: fixed;
             inset: 0;
             z-index: 0;
-            background-image: linear-gradient(#fff 50%, #dedede);
+            background-image: radial-gradient(circle closest-corner, #121420, #000 84%);
         }
 
         #color-picker {
-            position: absolute;
+            position: fixed;
             bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
+            left: 0;
+            right: 0;
             display: flex;
-            gap: 15px;
+            flex-wrap: nowrap;         /* SEMPRE su una riga sola */
+            justify-content: center;   /* centrati */
+            align-items: center;
+            /* gap scala con la larghezza: min 4px, ~2vw, max 15px */
+            gap: clamp(4px, 2vw, 15px);
             z-index: 10;
-            padding-left: 10vw;
-            padding-right: 10vw;
-            width: 100%;
-            margin-left: auto;
-            margin-right: auto;
-            flex-wrap: nowrap;
-            align-content: center;
-            justify-content: center;
+            padding: 8px 12px;
+            box-sizing: border-box;
         }
         .dot {
-            width: 30px;
-            height: 30px;
+            /* dimensione scala con la larghezza: min 16px, ~6vw, max 30px.
+               Rimpicciolendosi insieme al gap, i 7 pallini stanno su una riga
+               anche su schermi stretti, senza andare a capo. */
+            width: clamp(16px, 6vw, 30px);
+            height: clamp(16px, 6vw, 30px);
+            flex: 0 0 auto;            /* non si deforma */
+            aspect-ratio: 1 / 1;       /* resta rotondo */
             border-radius: 50%;
             cursor: pointer;
             border: 2px solid rgba(0,0,0,0.15);
